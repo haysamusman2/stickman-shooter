@@ -13,13 +13,15 @@ start tictactoe.html
 
 ## Git workflow
 
-Every meaningful change should be committed and pushed:
+After every meaningful change — a new feature, a balance tweak, a bug fix — commit and push immediately. Do not batch multiple unrelated changes into one commit. This ensures the GitHub repo always reflects the current working state and any version can be recovered.
 
 ```bash
 git add <file>
 git commit -m "short imperative description"
 git push
 ```
+
+Commit message rules: imperative mood, lowercase, no trailing period. Describe *what changed and why*, not the mechanical steps taken (e.g. `"cap rapid fire at 5s and remove stacking"`, not `"updated collectPowerup function"`).
 
 Remote: `https://github.com/haysamusman2/stickman-shooter` (main branch)
 
