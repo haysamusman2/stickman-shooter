@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stickman Shooter</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d0d1a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      overflow: hidden;
+      font-family: 'Segoe UI', sans-serif;
+    }
+    canvas {
+      display: block;
+      border: 2px solid #0f3460;
+      border-radius: 6px;
+      box-shadow: 0 0 30px rgba(15, 52, 96, 0.6);
+    }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+  const canvas = document.getElementById('gameCanvas');
+  const ctx    = canvas.getContext('2d');
+  const CW = 900, CH = 500;
+  canvas.width = CW; canvas.height = CH;
+
+  // ─── Constants ────────────────────────────────────────────────────────────
+  const GROUND_Y   = 420;
+  const TILE_W     = 120;
+
+  const P_SPEED    = 220;
+  const P_R        = 12;
+  const P_TORSO    = 30;
+  const P_LEG      = 28;
+  const GUN_LEN    = 22;
+
+  const B_SPEED    = 720;
+  const B_R        = 4;
+  const B_LIFE     = 3.0;
+
+  const Z_R        = 11;
+  const Z_TORSO    = 28;
+  const Z_LEG      = 24;
+  const Z_BASE_SPD = 65;
+  const Z_SPD_GROW = 0.8;
+  const Z_BASE_INT = 0.57;
+  const Z_MIN_INT  = 0.18;
+  const Z_INT_DECA = 0.12;
+  const Z_MARGIN   = 80;
+  const Z_DIE_DUR  = 0.6;
+
+  const CONTACT_DEATH = 3.0;
+  const CONTACT_R     = 34;
+
+  const BAR_W = 200, BAR_H = 16, HUD = 14;
+
+  // ─── Power-up constants ───────────────────────────────────────────────────
+  const POWERUP_INTERVAL   = 14;    // seconds between auto-spawns
+  const POWERUP_COLLECT_R  = 35;    // pickup radius
+  const POWERUP_FLOAT_AMP  = 5;     // bob amplitude
+  const POWERUP_DROP_CHANCE = 0.08; // zombie drop probability
+  const POWERUP_LIFETIME   = 25;    // seconds before it fades
+
+  const POWERUP_DEFS = {
+    rapidfire:  { color: '#ffdd00', glow: '#ff8800', symbol: '!', label: 'RAPID FIRE',  duration: 5  },
+    medkit:     { color: '#44ff88', glow: '#00cc44', symbol: '+', label: 'HEALED',      duration: 0  },
+    nuke:       { color: '#ff5555', glow: '#cc0000', symbol: '*', label: 'NUKE',        duration: 0  },
+    gunupgrade: { color: '#ff9900', glow: '#cc6600', symbol: '^', label: 'GUN UP',      duration: 0  },
+    multishot:  { color: '#44ccff', glow: '#0088cc', symbol: '>', label: 'MULTI-SHOT',  duration: 5  },
+  };
+  const POWERUP_KEYS = Object.keys(POWERUP_DEFS);
+
+  // ─── Gun levels ───────────────────────────────────────────────────────────
+  // cd = fire cooldown seconds, count = bullets per shot, piercing = pass-through
+  const GUN_LEVELS = [
+    { cd: 0.22, count: 1, damage: 1, name: 'PISTOL',  color: '#aaaaaa' },
+    { cd: 0.16, count: 1, damage: 2, name: 'CARBINE', color: '#ff9900' },
+    { cd: 0.13, count: 2, damage: 2, name: 'SMG',     color: '#44ccff' },
+    { cd: 0.10, count: 3, damage: 3, name: 'MINIGUN', color: '#ff4444' },
+  ];
+
+  // Spread angles (degrees from horizontal) per bullet count
+  const SPREAD_ANGLES = {
+    1: [0],
+    2: [-10, 10],
+    3: [-14, 0, 14],
+    5: [-22, -11, 0, 11, 22],
+  };
+
+  // ─── State ────────────────────────────────────────────────────────────────
+  const keys = {};
+  let lastTime = 0, elapsed = 0, cameraX = 0;
+  let bullets = [], zombies = [], powerups = [], popups = [];
+  let spawnTimer = 0, killCount = 0;
+  let powerupTimer = POWERUP_INTERVAL;
+  let nukeFlash = 0;
+  let gameState = 'start';
+  let overlayAlpha = 0;
+  let muzzleFlash = 0;
+
+  const P = {
+    x: 0, y: 0, dir: 1,
+    gunTimer: 0, contactTimer: 0,
+    walkCycle: 0, moving: false,
+    rapidFireTimer: 0,
+    multiShotTimer: 0,
+    gunLevel: 0,
+  };
+
+  // ─── World/screen helpers ─────────────────────────────────────────────────
+  const ws = wx => wx - cameraX;
+
+  // ─── Initialise / restart ─────────────────────────────────────────────────
+  function initGame() {
+    elapsed = 0; cameraX = 0; killCount = 0;
+    spawnTimer = Z_BASE_INT;
+    powerupTimer = POWERUP_INTERVAL;
+    nukeFlash = 0;
+    bullets = []; zombies = []; powerups = []; popups = [];
+    gameState = 'playing'; overlayAlpha = 0; muzzleFlash = 0;
+
+    P.x = 0; P.y = GROUND_Y - P_LEG;
+    P.dir = 1; P.gunTimer = 0;
+    P.contactTimer = 0; P.walkCycle = 0; P.moving = false;
+    P.rapidFireTimer = 0; P.multiShotTimer = 0; P.gunLevel = 0;
+  }
+
+  // ─── Input ────────────────────────────────────────────────────────────────
+  window.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    keys[k] = true;
+    if (gameState === 'start') { initGame(); return; }
+    if (k === 'r' && gameState === 'dead') initGame();
+  });
+  window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+  // ─── Gun helpers ──────────────────────────────────────────────────────────
+  function getGunCD() {
+    const base = GUN_LEVELS[P.gunLevel].cd;
+    return P.rapidFireTimer > 0 ? base / 2.5 : base;
+  }
+
+  // ─── Fire bullets ─────────────────────────────────────────────────────────
+  function fireBullets() {
+    const bx = P.x + P.dir * (26 + GUN_LEN);
+    const by = P.y - P_TORSO + 6;
+    const gl = GUN_LEVELS[P.gunLevel];
+
+    let count = P.multiShotTimer > 0 ? Math.max(gl.count, 5) : gl.count;
+    const damage = gl.damage;
+    const angles = SPREAD_ANGLES[count] || [0];
+
+    for (const deg of angles) {
+      const rad = deg * Math.PI / 180;
+      bullets.push({
+        x: bx, y: by,
+        vx: P.dir * B_SPEED * Math.cos(rad),
+        vy: B_SPEED * Math.sin(rad),
+        age: 0, damage,
+      });
+    }
+    muzzleFlash = 0.12;
+  }
+
+  // ─── Power-up helpers ─────────────────────────────────────────────────────
+  function addPopup(text, color) {
+    const yOff = popups.length * 32;
+    popups.push({ text, color, x: CW / 2, y: CH / 2 - 60 - yOff, timer: 1.8 });
+  }
+
+  function activateNuke() {
+    nukeFlash = 1.0;
+    let count = 0;
+    for (const z of zombies) {
+      if (!z.dying) { z.dying = true; z.dyingTimer = 0; count++; }
+    }
+    killCount += count;
+    addPopup(count > 0 ? `NUKE! +${count} KILLS` : 'NUKE!', '#ff5555');
+  }
+
+  function collectPowerup(pu) {
+    const def = POWERUP_DEFS[pu.type];
+    switch (pu.type) {
+      case 'rapidfire':
+        P.rapidFireTimer = def.duration;
+        addPopup('RAPID FIRE!', '#ffdd00');
+        break;
+      case 'medkit':
+        P.contactTimer = 0;
+        addPopup('HEALED!', '#44ff88');
+        break;
+      case 'nuke':
+        activateNuke();
+        break;
+      case 'gunupgrade':
+        if (P.gunLevel < 3) {
+          P.gunLevel++;
+          addPopup(`GUN UP: ${GUN_LEVELS[P.gunLevel].name}!`, GUN_LEVELS[P.gunLevel].color);
+        }
+        break;
+      case 'multishot':
+        P.multiShotTimer = def.duration;
+        addPopup('MULTI-SHOT!', '#44ccff');
+        break;
+    }
+  }
+
+  function spawnPowerup(worldX) {
+    if (powerups.length > 0) return;
+    const wave = Math.floor(elapsed / 10) + 1;
+    const available = POWERUP_KEYS.filter(t => {
+      if (t === 'gunupgrade' && P.gunLevel >= 3) return false;
+      if (t === 'gunupgrade' && wave % 7 !== 0) return false;
+      return true;
+    });
+    // Nukes are rarer — give everything else double weight
+    const weighted = [];
+    for (const k of available) { weighted.push(k); if (k !== 'nuke') weighted.push(k); }
+    const type = weighted[Math.floor(Math.random() * weighted.length)];
+    const x = worldX !== undefined ? worldX : P.x + (Math.random() - 0.5) * 500;
+    powerups.push({ type, x, y: GROUND_Y, age: 0 });
+  }
+
+  // ─── Spawn zombie ─────────────────────────────────────────────────────────
+  function spawnZombie() {
+    const tier  = Math.floor(elapsed / 10);
+    const speed = Z_BASE_SPD + tier * Z_SPD_GROW;
+    const left  = Math.random() < 0.5;
+    const spawnX = left ? cameraX - Z_MARGIN : cameraX + CW + Z_MARGIN;
+    zombies.push({
+      x: spawnX, y: GROUND_Y - Z_LEG,
+      speed, dir: left ? 1 : -1,
+      dying: false, dyingTimer: 0, walkCycle: 0, hp: 3
+    });
+  }
+
+  // ─── Update: input & auto-fire ────────────────────────────────────────────
+  function updateInput(dt) {
+    if (keys['a']) { P.x -= P_SPEED * dt; P.dir = -1; P.moving = true; }
+    else if (keys['d']) { P.x += P_SPEED * dt; P.dir = 1; P.moving = true; }
+    else { P.moving = false; }
+
+    if (P.moving) P.walkCycle += 7 * dt;
+
+    P.gunTimer -= dt;
+    if (P.gunTimer <= 0) { fireBullets(); P.gunTimer = getGunCD(); }
+
+    muzzleFlash = Math.max(0, muzzleFlash - dt);
+  }
+
+  // ─── Update: bullets ─────────────────────────────────────────────────────
+  function updateBullets(dt) {
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.age += dt;
+      if (b.age > B_LIFE) bullets.splice(i, 1);
+    }
+  }
+
+  // ─── Update: zombies walk ─────────────────────────────────────────────────
+  function updateZombies(dt) {
+    for (let i = zombies.length - 1; i >= 0; i--) {
+      const z = zombies[i];
+      if (z.dying) {
+        z.dyingTimer += dt;
+        if (z.dyingTimer >= Z_DIE_DUR) zombies.splice(i, 1);
+        continue;
+      }
+      z.dir = P.x > z.x ? 1 : -1;
+      z.x  += z.dir * z.speed * dt;
+      z.walkCycle += 5 * dt;
+    }
+  }
+
+  // ─── Update: spawner ──────────────────────────────────────────────────────
+  function updateSpawner(dt) {
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnZombie();
+      const tier     = Math.floor(elapsed / 10);
+      const interval = Math.max(Z_MIN_INT, Z_BASE_INT - tier * Z_INT_DECA);
+      spawnTimer = interval;
+      if (tier >= 10 && Math.random() < 0.25) spawnZombie();
+    }
+  }
+
+  // ─── Update: power-ups ────────────────────────────────────────────────────
+  function updatePowerups(dt) {
+    powerupTimer -= dt;
+    if (powerupTimer <= 0) { spawnPowerup(); powerupTimer = POWERUP_INTERVAL; }
+
+    for (let i = powerups.length - 1; i >= 0; i--) {
+      const pu = powerups[i];
+      pu.age += dt;
+      if (pu.age > POWERUP_LIFETIME) { powerups.splice(i, 1); continue; }
+      if (Math.hypot(P.x - pu.x, P.y - pu.y) < POWERUP_COLLECT_R) {
+        collectPowerup(pu);
+        powerups.splice(i, 1);
+      }
+    }
+
+    if (P.rapidFireTimer > 0) P.rapidFireTimer = Math.max(0, P.rapidFireTimer - dt);
+    if (P.multiShotTimer > 0) P.multiShotTimer = Math.max(0, P.multiShotTimer - dt);
+    nukeFlash = Math.max(0, nukeFlash - dt * 2.5);
+  }
+
+  // ─── Update: popups ───────────────────────────────────────────────────────
+  function updatePopups(dt) {
+    for (let i = popups.length - 1; i >= 0; i--) {
+      popups[i].timer -= dt;
+      popups[i].y -= 28 * dt;
+      if (popups[i].timer <= 0) popups.splice(i, 1);
+    }
+  }
+
+  // ─── Update: hit detection ────────────────────────────────────────────────
+  function updateHits() {
+    for (let bi = bullets.length - 1; bi >= 0; bi--) {
+      const b = bullets[bi];
+      let hit = false;
+      for (let zi = zombies.length - 1; zi >= 0; zi--) {
+        const z = zombies[zi];
+        if (z.dying) continue;
+        const zcx = z.x;
+        const zcy = z.y - Z_TORSO / 2;
+        if (Math.hypot(b.x - zcx, b.y - zcy) < 30) {
+          z.hp -= b.damage;
+          if (z.hp <= 0) {
+            z.dying = true; z.dyingTimer = 0; killCount++;
+            if (Math.random() < POWERUP_DROP_CHANCE) spawnPowerup(z.x);
+          }
+          hit = true; break;
+        }
+      }
+      if (hit) bullets.splice(bi, 1);
+    }
+  }
+
+  // ─── Update: contact timer ───────────────────────────────────────────────
+  function updateContact(dt) {
+    let touching = false;
+    for (const z of zombies) {
+      if (z.dying) continue;
+      if (Math.hypot(P.x - z.x, P.y - z.y) < CONTACT_R) { touching = true; break; }
+    }
+    if (touching) {
+      P.contactTimer += dt;
+      if (P.contactTimer >= CONTACT_DEATH) { gameState = 'dead'; overlayAlpha = 0; }
+    } else {
+      P.contactTimer = Math.max(0, P.contactTimer - dt * 0.5);
+    }
+  }
+
+  // ─── Draw: background (parallax) ─────────────────────────────────────────
+  function drawBackground() {
+    const sky = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+    sky.addColorStop(0, '#09091a');
+    sky.addColorStop(1, '#14213e');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, CW, GROUND_Y);
+
+    const bgOff = ((cameraX * 0.2) % TILE_W + TILE_W) % TILE_W;
+    for (let tx = -bgOff - TILE_W; tx < CW + TILE_W; tx += TILE_W) {
+      const idx = Math.floor((tx + bgOff) / TILE_W);
+      const bh1 = 60 + (Math.abs(idx * 37 + 7) % 70);
+      const bh2 = 40 + (Math.abs(idx * 53 + 13) % 50);
+
+      ctx.fillStyle = '#151530';
+      ctx.fillRect(tx + 4,  GROUND_Y - bh1, 42, bh1);
+      ctx.fillRect(tx + 58, GROUND_Y - bh2, 32, bh2);
+
+      ctx.fillStyle = 'rgba(80,80,160,0.4)';
+      for (let wy = GROUND_Y - bh1 + 10; wy < GROUND_Y - 8; wy += 14) {
+        ctx.fillRect(tx + 9,  wy, 7, 8);
+        ctx.fillRect(tx + 22, wy, 7, 8);
+        ctx.fillRect(tx + 33, wy, 7, 8);
+      }
+    }
+
+    ctx.fillStyle = '#17291a';
+    ctx.fillRect(0, GROUND_Y, CW, CH - GROUND_Y);
+
+    ctx.strokeStyle = '#2e5c32'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(0, GROUND_Y); ctx.lineTo(CW, GROUND_Y); ctx.stroke();
+
+    const fgOff = ((cameraX % TILE_W) + TILE_W) % TILE_W;
+    ctx.strokeStyle = '#254428'; ctx.lineWidth = 1;
+    for (let tx = -fgOff; tx < CW; tx += 40) {
+      ctx.beginPath(); ctx.moveTo(tx, GROUND_Y); ctx.lineTo(tx, GROUND_Y + 7); ctx.stroke();
+    }
+  }
+
+  // ─── Draw: power-ups ──────────────────────────────────────────────────────
+  function drawPowerups() {
+    for (const pu of powerups) {
+      const sx = ws(pu.x);
+      if (sx < -50 || sx > CW + 50) continue;
+      const def = POWERUP_DEFS[pu.type];
+      const floatY = pu.y - 24 - Math.sin(pu.age * 3) * POWERUP_FLOAT_AMP;
+
+      ctx.save();
+      // Fade when close to expiry
+      if (pu.age > POWERUP_LIFETIME - 4) {
+        ctx.globalAlpha = Math.max(0, (POWERUP_LIFETIME - pu.age) / 4);
+      }
+
+      // Glow halo
+      const grd = ctx.createRadialGradient(sx, floatY, 0, sx, floatY, 24);
+      grd.addColorStop(0, def.glow + 'bb');
+      grd.addColorStop(1, def.glow + '00');
+      ctx.fillStyle = grd;
+      ctx.beginPath(); ctx.arc(sx, floatY, 24, 0, Math.PI * 2); ctx.fill();
+
+      // Circle body
+      ctx.fillStyle = def.color;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(sx, floatY, 14, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+      // Symbol
+      ctx.fillStyle = '#111';
+      ctx.font = 'bold 16px Segoe UI';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(def.symbol, sx, floatY);
+
+      // Label below
+      ctx.fillStyle = def.color;
+      ctx.font = '9px Segoe UI';
+      ctx.textBaseline = 'top';
+      ctx.fillText(def.label, sx, floatY + 17);
+
+      ctx.restore();
+    }
+  }
+
+  // ─── Draw: stickman player ────────────────────────────────────────────────
+  function drawPlayer() {
+    const sx = CW / 2;
+    const sy = P.y;
+    const d  = P.dir;
+    const wc = P.walkCycle;
+    const ct = P.contactTimer / CONTACT_DEATH;
+
+    const cr = Math.round(220 + 35 * ct);
+    const cg = Math.round(220 * (1 - ct));
+    const cb = Math.round(220 * (1 - ct));
+    const bodyCol = `rgb(${cr},${cg},${cb})`;
+
+    ctx.save();
+    ctx.lineCap = 'round';
+
+    const shoulderY = sy - P_TORSO;
+    const headY     = shoulderY - P_R;
+
+    // Gun level glow on player
+    const gl = GUN_LEVELS[P.gunLevel];
+    if (P.gunLevel > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.25 + 0.1 * Math.sin(elapsed * 6);
+      const halo = ctx.createRadialGradient(sx, sy - P_TORSO / 2, 0, sx, sy - P_TORSO / 2, 30 + P.gunLevel * 6);
+      halo.addColorStop(0, gl.color);
+      halo.addColorStop(1, gl.color + '00');
+      ctx.fillStyle = halo;
+      ctx.beginPath(); ctx.arc(sx, sy - P_TORSO / 2, 30 + P.gunLevel * 6, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.strokeStyle = bodyCol; ctx.lineWidth = 2.5;
+    const lkx = sx - 8 + Math.sin(wc) * 13, lky = sy + P_LEG * 0.55;
+    const lfx = sx - 5 + Math.sin(wc) * 19, lfy = sy + P_LEG;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(lkx, lky); ctx.lineTo(lfx, lfy); ctx.stroke();
+    const rkx = sx + 8 - Math.sin(wc) * 13, rky = lky;
+    const rfx = sx + 5 - Math.sin(wc) * 19, rfy = lfy;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(rkx, rky); ctx.lineTo(rfx, rfy); ctx.stroke();
+
+    ctx.beginPath(); ctx.moveTo(sx, shoulderY); ctx.lineTo(sx, sy); ctx.stroke();
+
+    const fa1x = sx - d * 10,                      fa1y = shoulderY + 4;
+    const fa2x = sx - d * 16 + Math.sin(wc) * 9,  fa2y = shoulderY + 14;
+    const fa3x = sx - d * 22 + Math.sin(wc) * 6,  fa3y = shoulderY + 25;
+    ctx.beginPath(); ctx.moveTo(fa1x, fa1y); ctx.lineTo(fa2x, fa2y); ctx.lineTo(fa3x, fa3y); ctx.stroke();
+
+    const ga1x = sx + d * 10,  ga1y = shoulderY + 4;
+    const ga2x = sx + d * 18,  ga2y = shoulderY + 14;
+    const ga3x = sx + d * 26,  ga3y = shoulderY + 6;
+    ctx.beginPath(); ctx.moveTo(ga1x, ga1y); ctx.lineTo(ga2x, ga2y); ctx.lineTo(ga3x, ga3y); ctx.stroke();
+
+    // Gun barrel — color reflects gun level
+    const gunBarColor = P.gunLevel === 0 ? '#888' : gl.color;
+    const tipX = ga3x + d * GUN_LEN, tipY = ga3y;
+    ctx.strokeStyle = gunBarColor; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(ga3x, ga3y); ctx.lineTo(tipX, tipY); ctx.stroke();
+
+    if (muzzleFlash > 0) {
+      const alpha = muzzleFlash / 0.12;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      const grd = ctx.createRadialGradient(tipX, tipY, 0, tipX, tipY, 14);
+      grd.addColorStop(0, 'rgba(255,200,80,0.9)');
+      grd.addColorStop(1, 'rgba(255,100,0,0)');
+      ctx.fillStyle = grd;
+      ctx.beginPath(); ctx.arc(tipX, tipY, 14, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+    ctx.fillStyle = '#f4a261';
+    ctx.beginPath(); ctx.arc(tipX, tipY, 3, 0, Math.PI * 2); ctx.fill();
+
+    ctx.fillStyle = ct > 0.3
+      ? `rgb(${cr}, ${Math.round(cg * 0.6)}, ${Math.round(cb * 0.6)})`
+      : '#dedede';
+    ctx.strokeStyle = bodyCol; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sx, headY, P_R, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+    ctx.fillStyle = '#111';
+    ctx.beginPath(); ctx.arc(sx + d * 5, headY - 2, 2.5, 0, Math.PI * 2); ctx.fill();
+
+    ctx.restore();
+  }
+
+  // ─── Draw: zombie stickman ────────────────────────────────────────────────
+  function drawZombie(z) {
+    const sx = ws(z.x);
+    const sy = z.y;
+    const d  = z.dir;
+    const wc = z.walkCycle;
+
+    ctx.save();
+    ctx.lineCap = 'round';
+
+    if (z.dying) {
+      const prog = z.dyingTimer / Z_DIE_DUR;
+      ctx.globalAlpha = 1 - prog;
+      ctx.translate(sx, sy);
+      ctx.rotate(prog * (Math.PI / 2) * d);
+      ctx.translate(-sx, -sy);
+    }
+
+    const shoulderY = sy - Z_TORSO;
+    const headY     = shoulderY - Z_R;
+
+    const bodyHpCol = z.hp >= 3 ? '#3d8c3d' : z.hp === 2 ? '#8c6020' : '#8c2020';
+    ctx.strokeStyle = bodyHpCol; ctx.lineWidth = 2.5;
+    const lkx = sx - 7 + Math.sin(wc) * 11, lky = sy + Z_LEG * 0.55;
+    const lfx = sx - 5 + Math.sin(wc) * 16, lfy = sy + Z_LEG;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(lkx, lky); ctx.lineTo(lfx, lfy); ctx.stroke();
+    const rkx = sx + 7 - Math.sin(wc) * 11, rky = lky;
+    const rfx = sx + 5 - Math.sin(wc) * 16, rfy = lfy;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(rkx, rky); ctx.lineTo(rfx, rfy); ctx.stroke();
+
+    ctx.strokeStyle = bodyHpCol;
+    ctx.beginPath(); ctx.moveTo(sx + d * 3, shoulderY); ctx.lineTo(sx, sy); ctx.stroke();
+
+    const fa1x = sx + d * 10, fa1y = shoulderY + 6;
+    const fa2x = sx + d * 22, fa2y = shoulderY + 15;
+    const fa3x = sx + d * 32, fa3y = shoulderY + 19;
+    ctx.beginPath(); ctx.moveTo(fa1x, fa1y); ctx.lineTo(fa2x, fa2y); ctx.lineTo(fa3x, fa3y); ctx.stroke();
+
+    const ba1x = sx + d * 4,  ba1y = shoulderY + 3;
+    const ba2x = sx + d * 16, ba2y = shoulderY + 11;
+    const ba3x = sx + d * 25, ba3y = shoulderY + 15;
+    ctx.beginPath(); ctx.moveTo(ba1x, ba1y); ctx.lineTo(ba2x, ba2y); ctx.lineTo(ba3x, ba3y); ctx.stroke();
+
+    const hpCol = z.hp >= 3 ? '#50df50' : z.hp === 2 ? '#e0a030' : '#e04040';
+    const hpStr = z.hp >= 3 ? '#358035' : z.hp === 2 ? '#a06010' : '#901010';
+    ctx.fillStyle = hpCol; ctx.strokeStyle = hpStr; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sx + d * 3, headY, Z_R, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+    ctx.fillStyle = '#e94560';
+    ctx.beginPath(); ctx.arc(sx + d * 7,  headY - 2, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx + d * 1, headY - 2, 2,   0, Math.PI * 2); ctx.fill();
+
+    ctx.restore();
+  }
+
+  // ─── Draw: bullets ────────────────────────────────────────────────────────
+  function drawBullets() {
+    for (const b of bullets) {
+      const sx = ws(b.x);
+      ctx.fillStyle = 'rgba(244,162,97,0.25)';
+      ctx.beginPath();
+      ctx.arc(sx - b.vx * 0.016, b.y - b.vy * 0.016, B_R * 0.65, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#f4c261';
+      ctx.beginPath(); ctx.arc(sx, b.y, B_R, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // ─── Draw: nuke flash ─────────────────────────────────────────────────────
+  function drawNukeFlash() {
+    if (nukeFlash <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = nukeFlash * 0.7;
+    ctx.fillStyle = '#ff2200';
+    ctx.fillRect(0, 0, CW, CH);
+    ctx.restore();
+  }
+
+  // ─── Draw: popups (floating pickup text) ─────────────────────────────────
+  function drawPopups() {
+    for (const p of popups) {
+      const alpha = Math.min(1, p.timer);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.font = 'bold 24px Segoe UI';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 4;
+      ctx.strokeText(p.text, p.x, p.y);
+      ctx.fillStyle = p.color;
+      ctx.fillText(p.text, p.x, p.y);
+      ctx.restore();
+    }
+  }
+
+  // ─── Draw: HUD ────────────────────────────────────────────────────────────
+  function drawHUD() {
+    ctx.save();
+
+    // Kills — top left
+    ctx.fillStyle = '#e94560'; ctx.font = 'bold 18px Segoe UI'; ctx.textAlign = 'left';
+    ctx.fillText(`Kills: ${killCount}`, HUD, HUD + 18);
+
+    // Time — top right
+    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const s = String(Math.floor(elapsed % 60)).padStart(2, '0');
+    ctx.fillStyle = '#53d8fb'; ctx.textAlign = 'right';
+    ctx.fillText(`${m}:${s}`, CW - HUD, HUD + 18);
+
+    // Wave — below kills
+    const tier = Math.floor(elapsed / 10);
+    ctx.fillStyle = '#aaa'; ctx.font = '13px Segoe UI'; ctx.textAlign = 'left';
+    ctx.fillText(`Wave ${tier + 1}`, HUD, HUD + 38);
+
+    // ── Gun level (bottom right) ──────────────────────────────────────────
+    const gl = GUN_LEVELS[P.gunLevel];
+    ctx.textAlign = 'right';
+    ctx.fillStyle = gl.color;
+    ctx.font = 'bold 13px Segoe UI';
+    ctx.fillText(`GUN: ${gl.name}`, CW - HUD, CH - HUD - 8);
+    // Level pips
+    for (let i = 0; i < 3; i++) {
+      ctx.fillStyle = i < P.gunLevel ? gl.color : '#333';
+      ctx.beginPath();
+      ctx.arc(CW - HUD - 6 - i * 14, CH - HUD - 26, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // ── Active power-up timers (bottom left) ─────────────────────────────
+    let yOff = CH - HUD - 8;
+    if (P.multiShotTimer > 0) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#44ccff';
+      ctx.font = 'bold 12px Segoe UI';
+      ctx.fillText(`> MULTI-SHOT  ${P.multiShotTimer.toFixed(1)}s`, HUD, yOff);
+      yOff -= 18;
+    }
+    if (P.rapidFireTimer > 0) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#ffdd00';
+      ctx.font = 'bold 12px Segoe UI';
+      ctx.fillText(`! RAPID FIRE  ${P.rapidFireTimer.toFixed(1)}s`, HUD, yOff);
+      yOff -= 18;
+    }
+
+    // ── Danger bar ────────────────────────────────────────────────────────
+    if (P.contactTimer > 0) {
+      const ratio = P.contactTimer / CONTACT_DEATH;
+      const bx = (CW - BAR_W) / 2, by = CH - HUD - BAR_H;
+
+      ctx.fillStyle = ratio > 0.6 ? '#e94560' : '#ffaa00';
+      ctx.font = 'bold 12px Segoe UI'; ctx.textAlign = 'center';
+      ctx.fillText('! DANGER !', CW / 2, by - 5);
+
+      ctx.fillStyle = '#2a2a2a';
+      ctx.fillRect(bx, by, BAR_W, BAR_H);
+
+      const r = Math.round(255 * ratio), g = Math.round(180 * (1 - ratio));
+      ctx.fillStyle = `rgb(${r},${g},0)`;
+      ctx.fillRect(bx, by, BAR_W * ratio, BAR_H);
+
+      ctx.strokeStyle = '#555'; ctx.lineWidth = 1;
+      ctx.strokeRect(bx, by, BAR_W, BAR_H);
+    }
+
+    ctx.restore();
+  }
+
+  // ─── Draw: game over overlay ──────────────────────────────────────────────
+  function drawGameOver() {
+    const a = Math.min(1, overlayAlpha);
+    ctx.save();
+    ctx.globalAlpha = a * 0.82;
+    ctx.fillStyle = '#050510'; ctx.fillRect(0, 0, CW, CH);
+    ctx.globalAlpha = a;
+
+    const cy = CH / 2;
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = '#e94560'; ctx.font = 'bold 58px Segoe UI';
+    ctx.fillText('GAME OVER', CW / 2, cy - 60);
+
+    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const s = String(Math.floor(elapsed % 60)).padStart(2, '0');
+    ctx.fillStyle = '#eee'; ctx.font = '24px Segoe UI';
+    ctx.fillText(`Zombies killed: ${killCount}`, CW / 2, cy);
+    ctx.fillText(`Survived: ${m}:${s}`, CW / 2, cy + 38);
+
+    ctx.fillStyle = '#53d8fb'; ctx.font = '20px Segoe UI';
+    ctx.fillText('Press R to restart', CW / 2, cy + 90);
+
+    ctx.restore();
+  }
+
+  // ─── Draw: start screen ───────────────────────────────────────────────────
+  function drawStartScreen() {
+    ctx.fillStyle = '#09091a'; ctx.fillRect(0, 0, CW, CH);
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = '#e94560'; ctx.font = 'bold 50px Segoe UI';
+    ctx.fillText('STICKMAN SHOOTER', CW / 2, CH / 2 - 100);
+
+    ctx.fillStyle = '#eee'; ctx.font = '20px Segoe UI';
+    ctx.fillText('Survive the zombie horde!', CW / 2, CH / 2 - 50);
+
+    ctx.fillStyle = '#53d8fb'; ctx.font = '17px Segoe UI';
+    ctx.fillText('A / D  — Move & Aim        Gun fires automatically', CW / 2, CH / 2 - 10);
+    ctx.fillText("Don't let zombies touch you for 3 seconds!", CW / 2, CH / 2 + 18);
+
+    ctx.fillStyle = '#aaa'; ctx.font = '14px Segoe UI';
+    ctx.fillText('Power-ups:  [!] Rapid Fire   [+] Medkit   [*] Nuke   [^] Gun Upgrade   [>] Multi-Shot', CW / 2, CH / 2 + 50);
+    ctx.fillText('Collect power-ups by walking over them. Zombies drop them too!', CW / 2, CH / 2 + 72);
+
+    const pulse = 0.7 + 0.3 * Math.sin(Date.now() / 400);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = '#f4a261'; ctx.font = 'bold 22px Segoe UI';
+    ctx.fillText('Press any key to start', CW / 2, CH / 2 + 118);
+    ctx.globalAlpha = 1;
+  }
+
+  // ─── Main loop ────────────────────────────────────────────────────────────
+  function gameLoop(ts) {
+    const dt = Math.min((ts - lastTime) / 1000, 0.05);
+    lastTime = ts;
+
+    if (gameState === 'playing') {
+      elapsed += dt;
+      updateInput(dt);
+      updateBullets(dt);
+      updateZombies(dt);
+      updateSpawner(dt);
+      updatePowerups(dt);
+      updatePopups(dt);
+      updateHits();
+      updateContact(dt);
+      cameraX = P.x - CW / 2;
+
+      drawBackground();
+      drawPowerups();
+      drawBullets();
+      for (const z of zombies) drawZombie(z);
+      drawPlayer();
+      drawNukeFlash();
+      drawHUD();
+      drawPopups();
+
+    } else if (gameState === 'dead') {
+      overlayAlpha += dt * 1.5;
+
+      drawBackground();
+      drawPowerups();
+      drawBullets();
+      for (const z of zombies) drawZombie(z);
+      drawPlayer();
+      drawHUD();
+      drawGameOver();
+
+    } else {
+      drawStartScreen();
+    }
+
+    requestAnimationFrame(gameLoop);
+  }
+
+  requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(gameLoop); });
+</script>
+</body>
+</html>
